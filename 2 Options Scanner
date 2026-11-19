@@ -1,0 +1,116 @@
+name: Options Scanner
+
+on:
+  schedule:
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas numpy requests
+      - name: Run scanner
+        run: |
+          python - <<'EOF'
+          import os
+          import requests
+          import yfinance as yf
+          import pandas as pd
+          import numpy as np
+
+          WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+          TICKERS = ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN",
+                     "META", "GOOGL", "NFLX", "AVGO", "JPM", "COST"]
+          MIN_SCORE = 4   # out of 6
+          TOP_N = 5
+
+
+          def analyze(t):
+              df = yf.Ticker(t).history(period="1y", auto_adjust=True).dropna()
+              if len(df) < 60:
+                  return None
+              c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+              sma20, sma50 = c.rolling(20).mean(), c.rolling(50).mean()
+              d = c.diff()
+              gain = d.clip(lower=0).rolling(14).mean()
+              loss = (-d.clip(upper=0)).rolling(14).mean()
+              rsi = 100 - 100 / (1 + gain / loss)
+              macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+              macd_sig = macd.ewm(span=9, adjust=False).mean()
+              tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+              atr = tr.rolling(14).mean()
+              hi20 = h.rolling(20).max().shift(1)
+              lo20 = l.rolling(20).min().shift(1)
+              volx = v.iloc[-1] / v.rolling(20).mean().iloc[-1]
+
+              p, s20, s50 = c.iloc[-1], sma20.iloc[-1], sma50.iloc[-1]
+              r, m, ms, a = rsi.iloc[-1], macd.iloc[-1], macd_sig.iloc[-1], atr.iloc[-1]
+
+              call = sum([p > s20, s20 > s50, m > ms, 50 <= r <= 70, volx >= 1.2, p > hi20.iloc[-1]])
+              put = sum([p < s20, s20 < s50, m < ms, 30 <= r <= 50, volx >= 1.2, p < lo20.iloc[-1]])
+              return dict(t=t, price=p, rsi=r, volx=volx, call=int(call), put=int(put),
+                          call_stop=p - 1.5 * a, put_stop=p + 1.5 * a,
+                          trend=("up" if (p > s20 > s50 and m > ms) else
+                                 "down" if (p < s20 < s50 and m < ms) else "mixed"))
+
+
+          def table(rows, side):
+              key = "call" if side == "call" else "put"
+              stop = "call_stop" if side == "call" else "put_stop"
+              rows = sorted(rows, key=lambda x: (x[key], x["volx"]), reverse=True)
+              rows = [x for x in rows if x[key] >= MIN_SCORE][:TOP_N]
+              if not rows:
+                  return "None today."
+              lines = [f"{'TICKER':<7}{'PRICE':>9}{'SCORE':>7}{'RSI':>5}{'VOLx':>6}{'STOP':>9}"]
+              for x in rows:
+                  lines.append(f"{x['t']:<7}{x['price']:>9.2f}{str(x[key])+'/6':>7}"
+                               f"{x['rsi']:>5.0f}{x['volx']:>6.1f}{x[stop]:>9.2f}")
+              return "```\n" + "\n".join(lines) + "\n```"
+
+
+          results = {}
+          for t in TICKERS:
+              try:
+                  r = analyze(t)
+                  if r:
+                      results[t] = r
+              except Exception:
+                  pass
+
+          if "SPY" not in results:
+              requests.post(WEBHOOK, json={"content": "Scanner error: could not load SPY data."})
+              raise SystemExit(1)
+
+          spy = results["SPY"]
+          regime = {"up": "BULLISH", "down": "BEARISH", "mixed": "MIXED / NO CLEAR TREND"}[spy["trend"]]
+
+          try:
+              vix = yf.Ticker("^VIX").history(period="5d")["Close"].iloc[-1]
+              vix_note = "low (options cheaper)" if vix < 16 else "high (options expensive)" if vix > 25 else "normal"
+              vix_line = f"VIX {vix:.1f}: {vix_note}\n"
+          except Exception:
+              vix_line = ""
+
+          rows = list(results.values())
+          msg = f"**Market regime: {regime}** (based on SPY trend)\n{vix_line}\n"
+
+          if spy["trend"] in ("up", "mixed"):
+              msg += "**CALL setups (bullish)**\n" + table(rows, "call") + "\n"
+          if spy["trend"] in ("down", "mixed"):
+              msg += "**PUT setups (bearish)**\n" + table(rows, "put") + "\n"
+          if spy["trend"] == "mixed":
+              msg += "Market is mixed. Consider waiting or sizing down.\n"
+
+          msg += ("STOP = underlying price that invalidates the setup (1.5x ATR). "
+                  "Options can lose 100% of premium. Signals are untested rules, not advice.")
+
+          r = requests.post(WEBHOOK, json={"content": msg[:1990]})
+          r.raise_for_status()
+          print("Posted.")
+          EOF
