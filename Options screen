@@ -1,0 +1,106 @@
+import csv
+import json
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+BASE = "https://sandbox.tradier.com/v1"
+
+def items(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+def number(value):
+    try:
+        return float(value) if value is not None else None
+    except (ValueError, TypeError):
+        return None
+
+def analyze(o, underlying, cfg):
+    volume = number(o.get("volume"))
+    oi = number(o.get("open_interest"))
+    bid, ask, last = (number(o.get(k)) for k in ("bid", "ask", "last"))
+    multiplier = number(o.get("contract_size"))
+    midpoint = (bid + ask) / 2 if bid is not None and ask is not None and 0 < bid <= ask else None
+    premium = volume * midpoint * multiplier if volume is not None and midpoint is not None and multiplier is not None and multiplier > 0 else None
+    ratio = volume / oi if volume is not None and oi is not None and oi > 0 else None
+    unusual = volume is not None and volume >= cfg["unusual_volume"] and ratio is not None and ratio >= cfg["volume_oi_ratio"]
+    heavy = volume is not None and volume >= cfg["heavy_volume"] and premium is not None and premium >= cfg["heavy_estimated_premium"]
+    side = o.get("option_type", "unknown")
+    flags = []
+    if heavy:
+        flags.append("heavy_" + side + "_activity_NOT_confirmed_buying")
+    if unusual:
+        flags.append("high_volume_vs_OI_NOT_historical_RVOL")
+    return dict(underlying=underlying, contract=o.get("symbol"), expiration=o.get("expiration_date"),
+                option_type=side, strike=o.get("strike"), volume=volume, open_interest=oi,
+                volume_oi_ratio=ratio, bid=bid, ask=ask, last=last, contract_size=multiplier,
+                estimated_gross_premium_midpoint=premium, last_trade_timestamp=o.get("trade_date"),
+                bid_timestamp=o.get("bid_date"), ask_timestamp=o.get("ask_date"),
+                buy_side="unavailable_chain_snapshot_only", flags=";".join(flags))
+
+def main():
+    token = os.environ.get("TRADIER_TOKEN")
+    if not token:
+        raise SystemExit("Set TRADIER_TOKEN to a Tradier sandbox token. No production token is needed.")
+    cfg = json.loads(Path("config.json").read_text())
+    session = requests.Session()
+    session.headers.update(Authorization="Bearer " + token, Accept="application/json")
+    session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=2, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True)))
+    def get(endpoint, **params):
+        time.sleep(1.1)
+        r = session.get(BASE + endpoint, params=params, timeout=40)
+        r.raise_for_status()
+        return r.json()
+    now = datetime.now(timezone.utc)
+    from zoneinfo import ZoneInfo
+    today = now.astimezone(ZoneInfo("America/New_York")).date()
+    rows, errors, coverage = [], [], []
+    for symbol in cfg["symbols"]:
+        try:
+            payload = get("/markets/options/expirations", symbol=symbol)
+            dates = items((payload.get("expirations") or {}).get("date"))
+            eligible = sorted(d for d in dates if 0 <= (datetime.fromisoformat(d).date()-today).days <= cfg["max_dte"])
+            chosen = eligible[:cfg["max_expirations"]]
+            if not chosen:
+                raise ValueError("No eligible expirations returned")
+            coverage.append(dict(symbol=symbol, eligible_expirations=eligible, scanned_expirations=chosen))
+            for expiration in chosen:
+                try:
+                    payload = get("/markets/options/chains", symbol=symbol, expiration=expiration, greeks="false")
+                    contracts = items((payload.get("options") or {}).get("option"))
+                    if not contracts:
+                        raise ValueError("Empty chain")
+                    rows.extend(analyze(o, symbol, cfg) for o in contracts)
+                except Exception as exc:
+                    errors.append(dict(symbol=symbol, expiration=expiration, error=str(exc)))
+        except Exception as exc:
+            errors.append(dict(symbol=symbol, error=str(exc)))
+    out = Path("reports"); out.mkdir(exist_ok=True)
+    alerts = sorted((r for r in rows if r["flags"]), key=lambda r:r["estimated_gross_premium_midpoint"] or 0, reverse=True)
+    for name, data in [("contracts", rows), ("alerts", alerts)]:
+        with (out / (name + ".csv")).open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["status"])
+            writer.writeheader(); writer.writerows(data)
+    report = dict(retrieved_at_utc=now.isoformat(), data_delay="15 minutes; snapshot fields may be older", status="partial" if errors else "ok", coverage=coverage, errors=errors, contract_count=len(rows), alert_count=len(alerts), alerts=alerts)
+    (out / "report.json").write_text(json.dumps(report, indent=2))
+    summary = ["# Options activity scanner", "", f"Retrieved: {now.isoformat()}", f"Contracts: {len(rows)} | Alerts: {len(alerts)} | Errors: {len(errors)}", "", "Delayed chain snapshots. Buying/selling direction unavailable. Premium is a midpoint-based estimate, not executed premium. Unusual means volume/OI, not historical relative volume.", "", "| Contract | Volume | OI | Estimated gross premium | Flags |", "|---|---:|---:|---:|---|"]
+    for r in alerts[:40]:
+        p = r['estimated_gross_premium_midpoint']
+        summary.append(f"| {r['contract']} | {r['volume']} | {r['open_interest']} | {p:,.0f} | {r['flags']} |" if p is not None else f"| {r['contract']} | {r['volume']} | {r['open_interest']} | unavailable | {r['flags']} |")
+    if errors:
+        summary += ["", "## Collection errors", "```json", json.dumps(errors, indent=2), "```"]
+    (out / "summary.md").write_text("\n".join(summary))
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write("\n".join(summary))
+    if errors or not rows:
+        raise SystemExit("Incomplete scan; inspect reports for coverage and errors")
+
+if __name__ == "__main__":
+    main()
