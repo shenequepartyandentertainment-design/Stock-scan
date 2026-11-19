@@ -1,0 +1,104 @@
+name: Stock Scanner
+
+on:
+  schedule:
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas numpy scikit-learn requests
+      - name: Run scanner
+        run: |
+          python - <<'EOF'
+          import os
+          import requests
+          import yfinance as yf
+          import pandas as pd
+          import numpy as np
+          from sklearn.ensemble import RandomForestClassifier
+
+          TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN",
+                     "META", "GOOGL", "NFLX", "AVGO", "JPM", "COST"]
+          HORIZON = 5
+          TARGET = 0.02
+          YEARS = 3
+          TOP_N = 10
+
+          WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+          COLS = ["ret1", "ret5", "ret20", "dist_sma50", "vol_ratio", "rsi", "volatility"]
+
+          def features(df):
+              c, v = df["Close"], df["Volume"]
+              f = pd.DataFrame(index=df.index)
+              f["ret1"] = c.pct_change()
+              f["ret5"] = c.pct_change(5)
+              f["ret20"] = c.pct_change(20)
+              f["dist_sma50"] = c / c.rolling(50).mean() - 1
+              f["vol_ratio"] = v / v.rolling(20).mean()
+              d = c.diff()
+              gain = d.clip(lower=0).rolling(14).mean()
+              loss = (-d.clip(upper=0)).rolling(14).mean()
+              f["rsi"] = 100 - 100 / (1 + gain / loss)
+              f["volatility"] = f["ret1"].rolling(20).std()
+              return f
+
+          def clean(x):
+              return x.replace([np.inf, -np.inf], np.nan).dropna()
+
+          train, latest = [], []
+          for t in TICKERS:
+              try:
+                  df = yf.Ticker(t).history(period=f"{YEARS}y", auto_adjust=True).dropna()
+              except Exception:
+                  continue
+              if len(df) < 120:
+                  continue
+              f = features(df)
+              f["target"] = (df["Close"].shift(-HORIZON) / df["Close"] - 1 > TARGET).astype(int)
+              f["ticker"] = t
+              f["price"] = df["Close"]
+              latest.append(f.iloc[[-1]].drop(columns="target"))
+              train.append(f.iloc[:-HORIZON])
+
+          if not train:
+              requests.post(WEBHOOK, json={"content": "Scanner error: no data downloaded."})
+              raise SystemExit(1)
+
+          train, latest = clean(pd.concat(train)).sort_index(), clean(pd.concat(latest))
+
+          cut = int(len(train) * 0.8)
+          a, b = train.iloc[:cut], train.iloc[cut:]
+          check = RandomForestClassifier(n_estimators=100, min_samples_leaf=20, random_state=42, n_jobs=-1)
+          check.fit(a[COLS], a["target"])
+          p = check.predict_proba(b[COLS])[:, 1]
+          top = b[p >= np.quantile(p, 0.8)]
+          base_rate, top_rate = b["target"].mean(), top["target"].mean()
+
+          model = RandomForestClassifier(n_estimators=200, min_samples_leaf=20, random_state=42, n_jobs=-1)
+          model.fit(train[COLS], train["target"])
+          latest["score"] = model.predict_proba(latest[COLS])[:, 1]
+          out = latest.sort_values("score", ascending=False).head(TOP_N)
+
+          lines = [f"{'TICKER':<7}{'PRICE':>9}{'RSI':>6}{'VOL x':>7}{'SCORE':>7}"]
+          for _, r in out.iterrows():
+              lines.append(f"{r['ticker']:<7}{r['price']:>9.2f}{r['rsi']:>6.0f}{r['vol_ratio']:>7.1f}{r['score']:>7.2f}")
+
+          msg = (
+              f"**AI Scanner** (chance of +{TARGET:.0%} in {HORIZON} days)\n"
+              "```\n" + "\n".join(lines) + "\n```\n"
+              f"Holdout check: base rate {base_rate:.1%}, model's top 20% {top_rate:.1%}. "
+              "If those are close, the scores are mostly noise. Not financial advice."
+          )
+
+          r = requests.post(WEBHOOK, json={"content": msg[:1990]})
+          r.raise_for_status()
+          print("Posted to Discord.")
+          EOF
